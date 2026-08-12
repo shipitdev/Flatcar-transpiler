@@ -1,31 +1,77 @@
 # Cloud-Config → Butane Transpiler (Prototype)
 
-A Go prototype that translates **cloud-config** YAML (used by [Cluster API](https://cluster-api.sigs.k8s.io/) for node provisioning) into **[Butane](https://coreos.github.io/butane/)** YAML (used by [Flatcar Container Linux](https://www.flatcar.org/) for first-boot provisioning via Ignition).
+![CI](https://github.com/shipitdev/Flatcar-transpiler/actions/workflows/validate.yml/badge.svg)
 
-> **Status**: Working prototype — covers the CAPI-relevant subset of cloud-config fields. Designed to be extended.
+**TL;DR:** Cluster API defaults to generating cloud-config for node
+provisioning, but a real, current Cluster API provider's own source
+documents that user customizations (`write_files`, `runcmd`, `ntp`) are
+silently dropped when provisioning Flatcar nodes via Ignition — and a
+real 2023 bug report shows this happening on an actual cluster. This is
+a working Go prototype that translates cloud-config into Butane YAML to
+close that gap, verified end-to-end against the real `butane` CLI.
+
+> **Status**: Working prototype — covers the CAPI-relevant subset of
+> cloud-config fields (`users`, `write_files`, `runcmd`). Designed to be
+> extended.
 
 ## The Problem
 
-Cluster API defaults to generating cloud-config because most Linux distributions use cloud-init. Flatcar doesn't — it uses Ignition, with Butane as its YAML front-end. When CAPI hands cloud-config to a Flatcar node, user-supplied customizations (`write_files`, `runcmd`, SSH keys) are **silently dropped**. The core cluster bootstrap works through CAPI's native Ignition support, but the user customization layer has no translator.
+Cluster API defaults to generating cloud-config because most Linux
+distributions use cloud-init. Flatcar doesn't — it uses Ignition, with
+Butane as its YAML front-end. When CAPI hands cloud-config to a Flatcar
+node, user-supplied customizations (`write_files`, `runcmd`, SSH keys)
+are **silently dropped**. The core cluster bootstrap works through CAPI's
+native Ignition support, but the user customization layer has no
+translator.
 
 This project builds that translator.
 
+```mermaid
+flowchart LR
+    A[Cluster API] -->|generates| B[cloud-config YAML]
+    B --> C{{This Transpiler}}
+    C -->|generates| D[Butane YAML]
+    D -->|compiled by\nexisting butane tool| E[Ignition JSON]
+    E -->|read once, at first boot| F[Flatcar Node]
+
+    style C fill:#2b6cb0,stroke:#1a365d,color:#fff
 ```
-Cluster API
-  → cloud-config YAML          (CAPI's default output)
-  → [THIS TRANSPILER]          (what this project builds)
-  → Butane YAML                (Flatcar's configuration format)
-  → butane compiler            (already exists — coreos/butane)
-  → Ignition JSON              (read once at first boot)
-```
+
+Only the highlighted node — **This Transpiler** — is what this project
+builds. Everything else (Cluster API, the `butane` compiler, Ignition,
+Flatcar's boot process) already exists.
+
+## Evidence This Gap Is Real
+
+- **[KubeVirt provider bug report (2023)](https://github.com/kubernetes-sigs/cluster-api-provider-kubevirt/issues/241)** —
+  a real Flatcar node's boot log rejecting `runcmd`, `sudo`, and a
+  `groups` type mismatch outright, on a real cluster.
+- **[Official Flatcar CAPI bootstrap provider](https://github.com/flatcar/cluster-api-bootstrap-provider-kubeadm-ignition)** —
+  a real, currently active effort under the CNCF Node Bootstrapping
+  working group. This confirms the problem is live right now, not
+  historical.
+
+## How This Maps to What the Project Is Looking For
+
+| Listed skill | Where it shows up here |
+|---|---|
+| **Go** | `transform()` in `transpiler/main.go` — the entire translation logic |
+| **YAML** | Parses cloud-config YAML, generates Butane YAML (JSON used as a stand-in for `yaml.v3` during prototyping — mechanical swap, see Extending section) |
+| **Cluster API** | See "Evidence" above — real, cited gap in current CAPI provider behavior |
+| **Linux Based OS** | See "Design Decisions" below — reasoning about Ignition's boot-time constraints and systemd unit semantics |
 
 ## What's Implemented
 
 The architecture is **parse → transform → generate**:
 
-1. **Parse** — structs shaped like cloud-config's input format (verified against [`flatcar/coreos-cloudinit`](https://github.com/flatcar/coreos-cloudinit) config structs)
-2. **Transform** — the only place real logic lives; converts input shape to output shape
-3. **Generate** — structs shaped like Butane's output format (verified against [`coreos/butane`](https://github.com/coreos/butane) `base/v0_5/schema.go`)
+1. **Parse** — structs shaped like cloud-config's input format (verified
+   against [`flatcar/coreos-cloudinit`](https://github.com/flatcar/coreos-cloudinit)
+   config structs)
+2. **Transform** — the only place real logic lives; converts input shape
+   to output shape
+3. **Generate** — structs shaped like Butane's output format (verified
+   against [`coreos/butane`](https://github.com/coreos/butane)
+   `base/v0_5/schema.go`)
 
 ### Field Mappings
 
@@ -39,15 +85,50 @@ The architecture is **parse → transform → generate**:
 | `write_files[].permissions` | `storage.files[].mode` | Octal string `"0644"` → integer `420` |
 | `runcmd[]` | `systemd.units[]` | All commands → single `Type=oneshot` unit with multiple `ExecStart=` lines |
 
-### Design Decision: `runcmd` → systemd unit
+## Design Decisions
 
-`runcmd` has no direct Butane equivalent. The chosen approach: a single `Type=oneshot` systemd unit with multiple `ExecStart=` lines, which systemd executes sequentially, stopping on first failure. This is verified correct per `systemd.service(5)` and matches the unit generation pattern used by Butane's own `mountUnitFromFS`.
+### `runcmd` → systemd unit
+
+`runcmd` has no direct Butane equivalent — Ignition is deliberately
+declarative-only and can't execute arbitrary commands. Two approaches
+were considered:
+
+- **Rejected: separate systemd units chained via `After=`/`Requires=`**
+  for each command. Gives per-command visibility, but adds generated
+  YAML and more moving parts for no correctness benefit once the
+  simpler option was verified.
+- **Chosen: one `Type=oneshot` unit with multiple `ExecStart=` lines.**
+  Verified against the real `systemd.service(5)` man page: `oneshot`
+  units run multiple `ExecStart=` lines sequentially and stop
+  automatically on first failure — this preserves cloud-config's
+  ordering guarantee with less generated output. Matches the unit
+  generation pattern used by Butane's own `mountUnitFromFS`.
+
+### `variant: flatcar`, not `variant: fcos`
+
+Early prototyping used the generic `fcos` (Fedora CoreOS) Butane variant
+while learning the general shape of Butane. Reading Butane's actual
+variant registration code (`RegisterTranslator("flatcar", "1.1.0", ...)`
+in `config/config.go`) surfaced that Flatcar has its own dedicated
+variant. This was independently re-verified by compiling output with
+`variant: flatcar, version: 1.1.0` against the real `butane` binary
+(`--strict` mode) before adopting it — not just trusted on inspection.
 
 ## Running
 
 ```bash
 go run transpiler/main.go
 ```
+
+### Testing
+
+```bash
+go test ./... -v
+```
+
+Table-driven unit tests cover all three fields (`users`, `write_files`
+including the octal-mode conversion, and `runcmd` ordering), plus the
+`variant`/`version` header and empty-input behavior.
 
 ### Example Output
 
@@ -85,6 +166,11 @@ The transpiler produces Butane-shaped output targeting `variant: flatcar`, `vers
   }
 }
 ```
+
+This exact output has been validated end-to-end: converted to YAML and
+compiled cleanly through the real `butane` CLI with `--strict` mode — see
+`.github/workflows/validate.yml`, which runs this same validation on
+every push.
 
 ## Schema Verification
 

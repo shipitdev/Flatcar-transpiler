@@ -1,0 +1,55 @@
+name: Validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-test-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Build
+        run: go build ./...
+
+      - name: Run unit tests
+        run: go test ./... -v
+
+      - name: Run transpiler on test input
+        run: go run transpiler/main.go > transpiler_output.json
+
+      - name: Set up Python (for JSON→YAML conversion)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Convert transpiler output to YAML
+        run: |
+          pip install pyyaml --quiet
+          python3 -c "
+          import json, yaml
+          with open('transpiler_output.json') as f:
+              data = json.load(f)
+          with open('transpiler_output.bu', 'w') as f:
+              yaml.dump(data, f)
+          "
+
+      - name: Download real butane CLI
+        run: |
+          LATEST_TAG=$(curl -sIL https://github.com/coreos/butane/releases/latest \
+            | grep -i location | tail -1 | grep -oE 'v[0-9.]+' | tr -d '\r')
+          curl -sL -o butane \
+            "https://github.com/coreos/butane/releases/download/${LATEST_TAG}/butane-x86_64-unknown-linux-gnu"
+          chmod +x butane
+
+      - name: Validate output against real butane (--strict)
+        run: ./butane --pretty --strict transpiler_output.bu
